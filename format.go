@@ -10,6 +10,9 @@ package gmf
 #include <libavdevice/avdevice.h>
 #include "libavutil/opt.h"
 
+// for log_packet:
+#include <libavutil/timestamp.h>
+
 static AVStream* gmf_get_stream(AVFormatContext *ctx, int idx) {
 	return ctx->streams[idx];
 }
@@ -43,6 +46,64 @@ static char *gmf_sprintf_sdp(AVFormatContext *ctx) {
 	av_sdp_create(&ctx, 1, sdp, sizeof(char)*16384);
 	return sdp;
 }
+
+///
+
+static void log_packet(const AVFormatContext *fmt_ctx, const AVPacket *pkt, const char *tag)
+{
+    AVRational *time_base = &fmt_ctx->streams[pkt->stream_index]->time_base;
+
+    printf("%s: pts:%s pts_time:%s dts:%s dts_time:%s duration:%s duration_time:%s stream_index:%d\n",
+           tag,
+           av_ts2str(pkt->pts), av_ts2timestr(pkt->pts, time_base),
+           av_ts2str(pkt->dts), av_ts2timestr(pkt->dts, time_base),
+           av_ts2str(pkt->duration), av_ts2timestr(pkt->duration, time_base),
+           pkt->stream_index);
+}
+
+extern int goStreamingCallbackHandler(int, void *, int);
+
+static int write_packet(void *opaque, uint8_t *buf, int buf_size)
+{
+    return goStreamingCallbackHandler((int)opaque, buf, buf_size);
+}
+
+static AVFormatContext *NewStreamingOutputCtxWithFormatName(int chStreamId, const char *format_name)
+{
+    AVFormatContext *ofmt_ctx = NULL;
+    AVIOContext *avio_ctx = NULL;
+    uint8_t *avio_ctx_buffer = NULL;
+    size_t avio_ctx_buffer_size = 4096;
+
+    int ret = 0;
+
+    avio_ctx_buffer = av_malloc(avio_ctx_buffer_size);
+    if (!avio_ctx_buffer) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    avio_ctx = avio_alloc_context(avio_ctx_buffer, avio_ctx_buffer_size,
+                                  1, (void *)chStreamId, NULL, &write_packet, NULL);
+    if (!avio_ctx) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    ret = avformat_alloc_output_context2(&ofmt_ctx, NULL, format_name, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "Could not create output context\n");
+        goto end;
+    }
+    ofmt_ctx->pb = avio_ctx;
+
+    return ofmt_ctx;
+end:
+    avformat_free_context(ofmt_ctx);
+    av_freep(&avio_ctx->buffer);
+    av_free(avio_ctx);
+    return NULL;
+}
 */
 import "C"
 
@@ -51,6 +112,8 @@ import (
 	"fmt"
 	"os"
 	"unsafe"
+
+	"github.com/mkrufky/cpool"
 )
 
 var (
@@ -130,6 +193,48 @@ func NewOutputCtx(i interface{}) (*FmtCtx, error) {
 	}
 
 	this.Filename = this.ofmt.Filename
+
+	return this, nil
+}
+
+type StreamBufferData struct {
+	Bytes []byte
+}
+
+type StreamBufferContext struct {
+	ChStreamId int
+}
+
+var ChStreamPool = cpool.NewCpool()
+
+//export goStreamingCallbackHandler
+func goStreamingCallbackHandler(opaque C.int, buf unsafe.Pointer, bufSize C.int) C.int {
+	id := int(opaque)
+	chStreamInt, err := ChStreamPool.GetConnection(id)
+	if err != nil {
+		panic(err)
+	}
+	chStream := chStreamInt.(chan StreamBufferData)
+	chStream <- StreamBufferData{Bytes: C.GoBytes(buf, bufSize)}
+	return bufSize
+}
+
+func NewStreamingOutputCtxWithFormatName(chStreamId int, format string) (*FmtCtx, error) {
+	this := &FmtCtx{streams: make(map[int]*Stream)}
+
+	cFormat := C.CString(format)
+	defer C.free(unsafe.Pointer(cFormat))
+
+	this.avCtx = C.NewStreamingOutputCtxWithFormatName(C.int(chStreamId), cFormat)
+	if this.avCtx == nil {
+		return nil, errors.New(fmt.Sprintf("unable to allocate context"))
+	}
+
+	if this.avCtx.oformat != nil {
+		this.avCtx.oformat.flags |= C.AVFMT_NOFILE
+	}
+
+	this.ofmt = &OutputFmt{avOutputFmt: this.avCtx.oformat}
 
 	return this, nil
 }
